@@ -1,10 +1,8 @@
 from model import LLMModel
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import asyncio
-import json
 
 app = FastAPI()
 model = LLMModel(
@@ -23,25 +21,23 @@ app.add_middleware(
 )
 
 
-async def fake_video_streamer():
-    for i in range(10):
-        await asyncio.sleep(1)
-        print(f"Currently in {i}")
-        yield "data: Hehe " + str(i) + " \n\n"
-
-
 class InferenceRequest(BaseModel):
     prompt: str
 
 
-# @app.post("/query")
-# def perform_inference(request: InferenceRequest):
-#     return {"data": model.generate(request.prompt)}
+@app.post("/api/test")
+def test(request: InferenceRequest):
+    print(request)
 
 
-@app.post("/test")
-async def test_streaming(request: InferenceRequest):
-    return StreamingResponse(model.stream(request.prompt), media_type="text/event-stream")
+def stream_wrapper(prompt: str):
+    for token in model.stream(prompt):
+        yield f"data: {token}\n\n"
+
+
+@app.post("/api/query")
+async def query_stream(request: InferenceRequest):
+    return StreamingResponse(stream_wrapper(request.prompt), media_type="text/event-stream")
 
 
 if __name__ == "__main__":
