@@ -1,5 +1,6 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline, TextStreamer
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline, TextIteratorStreamer
 import torch
+from threading import Thread
 
 chat_template = "{% for message in messages %}{% if message['role'] == 'user' %}{{ bos_token + 'User: ' + message['content'].strip() + '\\n\\n' }}{% elif message['role'] == 'system' %}{{ message['content'].strip() + '\\n\\n' }}{% elif message['role'] == 'assistant' %}{{ 'Assistant: '  + message['content'].strip() + '\\n\\n' + eos_token }}{% endif %}{% if loop.last and add_generation_prompt %}{{ bos_token + 'Assistant: ' }}{% endif %}{% endfor %}"
 
@@ -11,6 +12,11 @@ class LLMModel:
         self.personality = personality
         self.scene_description = scene_description
 
+        # additional model config
+        self.max_tokens = 1024
+        self.temperature = 1
+        self.repetition_penalty = 1.1
+
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
@@ -18,23 +24,26 @@ class LLMModel:
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
 
-        model = AutoModelForCausalLM.from_pretrained(
+        self.model = AutoModelForCausalLM.from_pretrained(
             model_name, quantization_config=bnb_config)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.tokenizer.chat_template = chat_template
 
-        streamer = TextStreamer(self.tokenizer, skip_prompt=True)
+        self.streamer = TextIteratorStreamer(
+            self.tokenizer, skip_prompt=True, skip_special_tokens=True)
 
-        self.model = pipeline(
-            model=model,
+        self.pipeline = pipeline(
+            model=self.model,
             tokenizer=self.tokenizer,
             task="text-generation",
-            do_sample=True,
-            temperature=1,
-            repetition_penalty=1.1,
             return_full_text=False,
-            max_new_tokens=500,
-            streamer=streamer
+            do_sample=True,
+
+            temperature=self.temperature,
+            repetition_penalty=self.repetition_penalty,
+            max_new_tokens=self.max_tokens,
+
+            streamer=self.streamer
         )
         self.history = self.generate_initial_history()
 
@@ -96,13 +105,38 @@ The following is additional information about the scene that both {user} and {ch
             self.history, tokenize=False, add_generation_prompt=True)
         final_prompt = chat_template.format(char=self.char, user=self.user)
 
-        output = self.model(final_prompt)[0]["generated_text"]
+        output = self.pipeline(final_prompt)[0]["generated_text"]
         output = output.strip()
 
         self.history.append(
             {"role": "assistant", "name": self.char, "content": output})
 
         return output
+
+    def stream(self, prompt: str):
+        self.history.append(
+            {"role": "user", "name": self.user, "content": prompt})
+
+        chat_template = self.tokenizer.apply_chat_template(
+            self.history, tokenize=False, add_generation_prompt=True)
+        final_prompt = chat_template.format(char=self.char, user=self.user)
+
+        inputs = self.tokenizer([final_prompt], return_tensors="pt")
+        # move inputs to same device as model
+        inputs = inputs.to(self.model.device)
+
+        generation_kwargs = dict(inputs, streamer=self.streamer, max_new_tokens=self.max_tokens, temperature=self.temperature, do_sample=True,
+                                 repetition_penalty=self.repetition_penalty,)
+        thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+        thread.start()
+
+        generated_text = ""
+        for new_text in self.streamer:
+            generated_text += new_text
+            yield (new_text)
+
+        self.history.append(
+            {"role": "assistant", "name": self.char, "content": generated_text.strip()})
 
     def reset_chat(self):
         self.history = self.generate_initial_history()
